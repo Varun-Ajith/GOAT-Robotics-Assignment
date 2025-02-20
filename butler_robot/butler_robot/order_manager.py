@@ -2,173 +2,150 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-import json
 from enum import Enum
-import threading
+import json
 import time
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+import threading
 
-class OrderState(Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
+class RobotState(Enum):
+    HOME = "home"
+    MOVING_TO_KITCHEN = "moving_to_kitchen"
+    AT_KITCHEN = "at_kitchen"
+    MOVING_TO_TABLE = "moving_to_table"
+    AT_TABLE = "at_table"
+    RETURNING_HOME = "returning_home"
+    WAITING_KITCHEN = "waiting_kitchen"
+    WAITING_TABLE = "waiting_table"
 
-class OrderManager(Node):
+class ButlerNode(Node):
     def __init__(self):
-        super().__init__('order_manager')
+        super().__init__('butler_node')
+        self.state = RobotState.HOME
         
-        # Use callback group for handling multiple callbacks
-        self.callback_group = ReentrantCallbackGroup()
+        # Publishers
+        self.status_pub = self.create_publisher(String, 'robot_status', 10)
         
-        # Publisher for new orders
-        self.order_pub = self.create_publisher(
-            String, 
-            'new_order', 
-            10
-        )
-        
-        # Subscriber for robot status
-        self.status_sub = self.create_subscription(
+        # Subscribers
+        self.order_sub = self.create_subscription(
             String,
-            'robot_status',
-            self.status_callback,
-            10,
-            callback_group=self.callback_group
-        )
+            'new_order',
+            self.order_callback,
+            10)
         
-        # Initialize order tracking
-        self.current_orders = {}  # Dictionary to track orders
-        self.robot_status = "home"
+        self.confirmation_sub = self.create_subscription(
+            String,
+            'confirmation',
+            self.confirmation_callback,
+            10)
+
+        # Timeout settings
+        self.TIMEOUT_DURATION = 30.0  # 30 seconds timeout
+        self.waiting_timer = None
+        self.confirmation_received = False
         
-        # Create service timer for checking order status
-        self.create_timer(
-            1.0,  # 1 second
-            self.check_orders_status,
-            callback_group=self.callback_group
-        )
-        
-        self.get_logger().info('Order Manager Node has been started')
+        self.get_logger().info('Butler Robot Node has been started')
 
-    def status_callback(self, msg):
-        """Handle robot status updates"""
-        self.robot_status = msg.data
-        self.get_logger().info(f'Robot Status: {msg.data}')
-        
-        # Update order states based on robot status
-        for order_id, order in self.current_orders.items():
-            if order['state'] == OrderState.PENDING and "Moving to kitchen" in msg.data:
-                order['state'] = OrderState.IN_PROGRESS
-            elif order['state'] == OrderState.IN_PROGRESS and f"Arrived at table {order['table_number']}" in msg.data:
-                order['state'] = OrderState.COMPLETED
-            elif "Arrived at home position" in msg.data:
-                if order['state'] == OrderState.IN_PROGRESS:
-                    order['state'] = OrderState.COMPLETED
+    def publish_status(self, status_msg):
+        msg = String()
+        msg.data = status_msg
+        self.status_pub.publish(msg)
+        self.get_logger().info(f'Robot Status: {status_msg}')
 
-    def check_orders_status(self):
-        """Periodically check the status of orders"""
-        current_time = time.time()
-        orders_to_remove = []
+    def simulate_movement(self, duration=2.0):
+        time.sleep(duration)
 
-        for order_id, order in self.current_orders.items():
-            # Check for timeout (5 minutes)
-            if current_time - order['timestamp'] > 300:  # 5 minutes timeout
-                if order['state'] != OrderState.COMPLETED:
-                    order['state'] = OrderState.FAILED
-                    self.get_logger().warn(f'Order {order_id} for table {order["table_number"]} timed out')
-                orders_to_remove.append(order_id)
-            
-            # Remove completed orders after 1 minute
-            elif order['state'] == OrderState.COMPLETED and current_time - order['timestamp'] > 60:
-                orders_to_remove.append(order_id)
+    def start_timeout_timer(self):
+        self.confirmation_received = False
+        self.waiting_timer = threading.Timer(self.TIMEOUT_DURATION, self.handle_timeout)
+        self.waiting_timer.start()
 
-        # Remove processed orders
-        for order_id in orders_to_remove:
-            del self.current_orders[order_id]
+    def cancel_timeout_timer(self):
+        if self.waiting_timer:
+            self.waiting_timer.cancel()
+            self.waiting_timer = None
 
-    def send_order(self, table_number):
-        """Send a new order to the robot"""
+    def handle_timeout(self):
+        self.get_logger().warn('Timeout occurred while waiting for confirmation')
+        if self.state == RobotState.WAITING_KITCHEN:
+            self.publish_status("Timeout at kitchen. Returning home")
+            self.return_home()
+        elif self.state == RobotState.WAITING_TABLE:
+            self.publish_status("Timeout at table. Returning to kitchen")
+            self.move_to_kitchen()
+            self.publish_status("Returning home")
+            self.return_home()
+
+    def confirmation_callback(self, msg):
         try:
-            # Create order data
-            order_data = {
-                'table_number': table_number,
-                'timestamp': time.time()
-            }
-            
-            # Create order tracking entry
-            order_id = f"order_{time.time()}"
-            self.current_orders[order_id] = {
-                'table_number': table_number,
-                'state': OrderState.PENDING,
-                'timestamp': time.time()
-            }
-            
-            # Publish order
-            msg = String()
-            msg.data = json.dumps(order_data)
-            self.order_pub.publish(msg)
-            
-            self.get_logger().info(f'Sent order for table {table_number}')
-            return order_id
-            
-        except Exception as e:
-            self.get_logger().error(f'Error sending order: {str(e)}')
-            return None
+            data = json.loads(msg.data)
+            location = data.get('location')
+            confirmed = data.get('confirmed', False)
 
-    def send_multiple_orders(self, table_numbers):
-        """Send multiple orders"""
-        order_ids = []
-        for table in table_numbers:
-            order_id = self.send_order(table)
-            if order_id:
-                order_ids.append(order_id)
-            time.sleep(0.5)  # Small delay between orders
-        return order_ids
+            if confirmed:
+                self.confirmation_received = True
+                self.cancel_timeout_timer()
+                
+                if location == 'kitchen' and self.state == RobotState.WAITING_KITCHEN:
+                    self.get_logger().info('Kitchen confirmation received')
+                    self.move_to_table(self.current_table)
+                elif location == 'table' and self.state == RobotState.WAITING_TABLE:
+                    self.get_logger().info('Table confirmation received')
+                    self.return_home()
 
-    def cancel_order(self, table_number):
-        """Cancel an order for a specific table"""
+        except json.JSONDecodeError:
+            self.get_logger().error('Invalid JSON format in confirmation message')
+
+    def move_to_kitchen(self):
+        self.state = RobotState.MOVING_TO_KITCHEN
+        self.publish_status(f"Moving to kitchen")
+        self.simulate_movement()
+        self.state = RobotState.WAITING_KITCHEN
+        self.publish_status(f"Waiting at kitchen for confirmation")
+        self.start_timeout_timer()
+
+    def move_to_table(self, table_number):
+        self.state = RobotState.MOVING_TO_TABLE
+        self.publish_status(f"Moving to table {table_number}")
+        self.simulate_movement()
+        self.state = RobotState.WAITING_TABLE
+        self.publish_status(f"Waiting at table {table_number} for confirmation")
+        self.start_timeout_timer()
+
+    def return_home(self):
+        self.state = RobotState.RETURNING_HOME
+        self.publish_status("Returning to home position")
+        self.simulate_movement()
+        self.state = RobotState.HOME
+        self.publish_status("Arrived at home position")
+
+    def order_callback(self, msg):
         try:
-            cancel_data = {
-                'table_number': table_number,
-                'action': 'cancel'
-            }
+            order_data = json.loads(msg.data)
+            table_number = order_data.get('table_number')
             
-            msg = String()
-            msg.data = json.dumps(cancel_data)
-            self.order_pub.publish(msg)
-            
-            # Update order state for the cancelled table
-            for order_id, order in self.current_orders.items():
-                if order['table_number'] == table_number and order['state'] != OrderState.COMPLETED:
-                    order['state'] = OrderState.FAILED
-                    self.get_logger().info(f'Order for table {table_number} has been cancelled')
-            
-        except Exception as e:
-            self.get_logger().error(f'Error cancelling order: {str(e)}')
+            if not table_number:
+                self.get_logger().error('Invalid order format: missing table number')
+                return
 
-    def get_order_status(self, order_id):
-        """Get the status of a specific order"""
-        if order_id in self.current_orders:
-            return self.current_orders[order_id]['state']
-        return None
+            self.get_logger().info(f'Processing order for table {table_number}')
+            
+            if self.state != RobotState.HOME:
+                self.get_logger().warn('Robot is busy, cannot process new order')
+                return
+
+            self.current_table = table_number
+            self.move_to_kitchen()
+            
+        except json.JSONDecodeError:
+            self.get_logger().error('Invalid JSON format in order message')
+        except Exception as e:
+            self.get_logger().error(f'Error processing order: {str(e)}')
 
 def main(args=None):
     rclpy.init(args=args)
-    
-    # Create and start the node with MultiThreadedExecutor
-    node = OrderManager()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    
-    try:
-        # Spin the node
-        executor.spin()
-    finally:
-        # Cleanup
-        executor.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+    node = ButlerNode()
+    rclpy.spin(node)
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
