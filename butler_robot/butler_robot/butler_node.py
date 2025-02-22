@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+
+import json
+import threading
+import time
+from enum import Enum
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from enum import Enum
-import json
-import time
-import threading
+
 
 class RobotState(Enum):
     HOME = "home"
@@ -19,43 +22,31 @@ class RobotState(Enum):
     RETURNING_TO_KITCHEN = "returning_to_kitchen"
     CANCELED = "canceled"
 
+
 class ButlerNode(Node):
+    TIMEOUT_DURATION = 30.0
+
     def __init__(self):
         super().__init__('butler_node')
         self.state = RobotState.HOME
-        
+
         # Publishers
         self.status_pub = self.create_publisher(String, 'robot_status', 10)
-        
+
         # Subscribers
-        self.order_sub = self.create_subscription(
-            String,
-            'new_order',
-            self.order_callback,
-            10)
-        
-        self.confirmation_sub = self.create_subscription(
-            String,
-            'confirmation',
-            self.confirmation_callback,
-            10)
-        
-        self.cancel_sub = self.create_subscription(
-            String,
-            'cancel_order',
-            self.cancel_callback,
-            10)
+        self.create_subscription(String, 'new_order', self.order_callback, 10)
+        self.create_subscription(String, 'confirmation', self.confirmation_callback, 10)
+        self.create_subscription(String, 'cancel_order', self.cancel_callback, 10)
 
         # Initialize variables
-        self.TIMEOUT_DURATION = 30.0
         self.waiting_timer = None
         self.confirmation_received = False
         self.current_table = None
         self.has_food = False
         self.is_canceled = False
-        self.order_queue = []  # Queue for multiple orders
-        self.remaining_tables = []  # Track remaining tables for multiple deliveries
-        
+        self.order_queue = []
+        self.remaining_tables = []
+
         self.get_logger().info('Butler Robot Node has been started')
 
     def publish_status(self, status_msg):
@@ -76,19 +67,19 @@ class ButlerNode(Node):
         try:
             data = json.loads(msg.data)
             table_number = data.get('table_number')
-            
+
             if table_number == self.current_table:
                 self.get_logger().info(f'Cancellation received for table {table_number}')
                 self.is_canceled = True
                 self.cancel_timeout_timer()
-                
+
                 if self.state in [RobotState.MOVING_TO_TABLE, RobotState.WAITING_TABLE]:
                     self.publish_status(f"Order canceled while serving table {table_number}. Returning to kitchen")
                     self.return_to_kitchen_then_home()
                 elif self.state in [RobotState.MOVING_TO_KITCHEN, RobotState.WAITING_KITCHEN]:
-                    self.publish_status(f"Order canceled while going to kitchen. Returning home")
+                    self.publish_status("Order canceled while going to kitchen. Returning home")
                     self.return_home()
-                
+
         except json.JSONDecodeError:
             self.get_logger().error('Invalid JSON format in cancel message')
 
@@ -105,16 +96,15 @@ class ButlerNode(Node):
     def handle_timeout(self):
         if self.is_canceled:
             return
-            
+
         self.get_logger().warn('Timeout occurred while waiting for confirmation')
-        
+
         if self.state == RobotState.WAITING_KITCHEN:
             self.publish_status("Timeout at kitchen. No food collected. Returning home")
             self.has_food = False
             self.return_home()
         elif self.state == RobotState.WAITING_TABLE:
-            if len(self.remaining_tables) > 0:
-                # Skip current table and move to next
+            if self.remaining_tables:
                 self.current_table = self.remaining_tables.pop(0)
                 self.move_to_table(self.current_table)
             else:
@@ -127,7 +117,7 @@ class ButlerNode(Node):
             self.publish_status("Returning to kitchen")
             if not self.simulate_movement():
                 return
-            
+
         self.state = RobotState.AT_KITCHEN
         self.publish_status("Arrived at kitchen")
         self.has_food = False
@@ -136,7 +126,7 @@ class ButlerNode(Node):
     def confirmation_callback(self, msg):
         if self.is_canceled:
             return
-            
+
         try:
             data = json.loads(msg.data)
             location = data.get('location')
@@ -145,46 +135,45 @@ class ButlerNode(Node):
             if confirmed:
                 self.confirmation_received = True
                 self.cancel_timeout_timer()
-                
+
                 if location == 'kitchen' and self.state == RobotState.WAITING_KITCHEN:
                     self.get_logger().info('Kitchen confirmation received')
                     self.has_food = True
-                    if self.remaining_tables:
-                        self.current_table = self.remaining_tables.pop(0)
-                        self.move_to_table(self.current_table)
-                    else:
-                        self.move_to_table(self.current_table)
+                    self.process_next_table()
                 elif location == 'table' and self.state == RobotState.WAITING_TABLE:
                     self.get_logger().info('Table confirmation received')
-                    if len(self.remaining_tables) > 0:
-                        self.current_table = self.remaining_tables.pop(0)
-                        self.move_to_table(self.current_table)
-                    else:
-                        self.has_food = False
-                        self.return_to_kitchen_then_home()
+                    self.process_next_table()
 
         except json.JSONDecodeError:
             self.get_logger().error('Invalid JSON format in confirmation message')
+
+    def process_next_table(self):
+        if self.remaining_tables:
+            self.current_table = self.remaining_tables.pop(0)
+            self.move_to_table(self.current_table)
+        else:
+            self.has_food = False
+            self.return_to_kitchen_then_home()
 
     def move_to_kitchen(self):
         self.state = RobotState.MOVING_TO_KITCHEN
         self.publish_status(f"Moving to kitchen to collect orders for tables: {[self.current_table] + self.remaining_tables}")
         if not self.simulate_movement():
             return
-            
+
         self.state = RobotState.WAITING_KITCHEN
-        self.publish_status(f"Waiting at kitchen for confirmation")
+        self.publish_status("Waiting at kitchen for confirmation")
         self.start_timeout_timer()
 
     def move_to_table(self, table_number):
         if self.is_canceled:
             return
-            
+
         self.state = RobotState.MOVING_TO_TABLE
         self.publish_status(f"Moving to table {table_number}")
         if not self.simulate_movement():
             return
-            
+
         self.state = RobotState.WAITING_TABLE
         self.publish_status(f"Waiting at table {table_number} for confirmation")
         self.start_timeout_timer()
@@ -193,6 +182,9 @@ class ButlerNode(Node):
         self.state = RobotState.RETURNING_HOME
         self.publish_status("Returning to home position")
         self.simulate_movement()
+        self.reset_robot_state()
+
+    def reset_robot_state(self):
         self.state = RobotState.HOME
         self.current_table = None
         self.has_food = False
@@ -204,7 +196,7 @@ class ButlerNode(Node):
         try:
             order_data = json.loads(msg.data)
             table_numbers = order_data.get('table_numbers', [order_data.get('table_number')])
-            
+
             if not table_numbers:
                 self.get_logger().error('Invalid order format: missing table numbers')
                 return
@@ -214,23 +206,21 @@ class ButlerNode(Node):
                 return
 
             self.get_logger().info(f'Processing orders for tables: {table_numbers}')
-            
-            # Set first table as current and rest as remaining
             self.current_table = table_numbers[0]
-            self.remaining_tables = table_numbers[1:] if len(table_numbers) > 1 else []
+            self.remaining_tables = table_numbers[1:]
             self.is_canceled = False
             self.move_to_kitchen()
-            
-        except json.JSONDecodeError:
-            self.get_logger().error('Invalid JSON format in order message')
-        except Exception as e:
+
+        except (json.JSONDecodeError, Exception) as e:
             self.get_logger().error(f'Error processing order: {str(e)}')
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = ButlerNode()
     rclpy.spin(node)
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
