@@ -123,7 +123,7 @@ For a demonstration of the robot’s performance and behavior across all milesto
 
 |**Milestone1**|**Milestone2**|**Milestone3**|**Milestone4**|**Milestone5**|
 |--------------|--------------|--------------|--------------|--------------|
-|[Milestone-1]() | [Milestone-1]() | [Milestone-1]() | [Milestone-1]() | [Milestone-1]() |
+|[Milestone-1](medias/Milestone1.gif) | [Milestone-2](medias/Milestone2.gif) | [Milestone-3](medias/Milestone3.gif) | [Milestone-5](medias/Milestone4.gif) | [Milestone-5](medias/Milestone5.gif) |
 
 ## Documentation and Approach
 
